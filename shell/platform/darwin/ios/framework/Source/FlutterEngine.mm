@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <type_traits>
 #define FML_USED_ON_EMBEDDER
 
 #import "flutter/shell/platform/darwin/ios/framework/Source/FlutterEngine_Internal.h"
@@ -50,7 +51,7 @@ NSString* const FlutterDefaultDartEntrypoint = nil;
   std::unique_ptr<flutter::Shell> _shell;
   NSString* _labelPrefix;
   std::unique_ptr<fml::WeakPtrFactory<FlutterEngine>> _weakFactory;
-
+  fml::AutoResetWaitableEvent latch;
   fml::WeakPtr<FlutterViewController> _viewController;
   fml::scoped_nsobject<FlutterObservatoryPublisher> _publisher;
 
@@ -449,6 +450,24 @@ NSString* const FlutterDefaultDartEntrypoint = nil;
         return std::make_unique<flutter::Rasterizer>(shell, shell.GetTaskRunners());
       };
 
+  std::function<void(std::unique_ptr<flutter::Shell>)> on_shell_created =
+      [&self, &entrypoint](std::unique_ptr<flutter::Shell> shell) {
+        if (shell == nullptr) {
+          FML_LOG(ERROR) << "Could not start a shell FlutterEngine with entrypoint: "
+                         << entrypoint.UTF8String;
+        } else {
+          self->_shell.reset(shell.release());
+          [self setupChannels];
+          if (!_platformViewsController) {
+            _platformViewsController.reset(new flutter::FlutterPlatformViewsController());
+          }
+          _publisher.reset([[FlutterObservatoryPublisher alloc] init]);
+          [self maybeSetupPlatformViewChannels];
+          _shell->GetIsGpuDisabledSyncSwitch()->SetSwitch(_isGpuDisabled ? true : false);
+          self->latch.Signal();
+        }
+      };
+
   if (flutter::IsIosEmbeddedViewsPreviewEnabled()) {
     // Embedded views requires the gpu and the platform views to be the same.
     // The plan is to eventually dynamically merge the threads when there's a
@@ -469,7 +488,8 @@ NSString* const FlutterDefaultDartEntrypoint = nil;
                                     std::move(windowData),    // window data
                                     std::move(settings),      // settings
                                     on_create_platform_view,  // platform view creation
-                                    on_create_rasterizer      // rasterzier creation
+                                    on_create_rasterizer,      // rasterzier creation
+                                    on_shell_created
     );
   } else {
     flutter::TaskRunners task_runners(threadLabel.UTF8String,                          // label
@@ -483,24 +503,12 @@ NSString* const FlutterDefaultDartEntrypoint = nil;
                                     std::move(windowData),    // window data
                                     std::move(settings),      // settings
                                     on_create_platform_view,  // platform view creation
-                                    on_create_rasterizer      // rasterzier creation
+                                    on_create_rasterizer,     // rasterzier creation
+                                    on_shell_created
     );
   }
 
-  if (_shell == nullptr) {
-    FML_LOG(ERROR) << "Could not start a shell FlutterEngine with entrypoint: "
-                   << entrypoint.UTF8String;
-  } else {
-    [self setupChannels];
-    if (!_platformViewsController) {
-      _platformViewsController.reset(new flutter::FlutterPlatformViewsController());
-    }
-    _publisher.reset([[FlutterObservatoryPublisher alloc] init]);
-    [self maybeSetupPlatformViewChannels];
-    _shell->GetIsGpuDisabledSyncSwitch()->SetSwitch(_isGpuDisabled ? true : false);
-  }
-
-  return _shell != nullptr;
+  return NO;
 }
 
 - (BOOL)run {
@@ -706,6 +714,11 @@ NSString* const FlutterDefaultDartEntrypoint = nil;
     _shell->GetIsGpuDisabledSyncSwitch()->SetSwitch(value ? true : false);
   }
   _isGpuDisabled = value;
+}
+
+- (BOOL)ensureEngineInitialized {
+  latch.Wait();
+  return _shell != nullptr;
 }
 
 @end
